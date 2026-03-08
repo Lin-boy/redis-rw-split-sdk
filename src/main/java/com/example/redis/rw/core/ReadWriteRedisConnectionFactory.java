@@ -6,21 +6,26 @@ import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.connection.RedisSentinelConnection;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ThreadLocalRandom;
 
+/**
+ * Connection factory supporting read-write splitting with high-concurrency optimization.
+ */
 public class ReadWriteRedisConnectionFactory implements RedisConnectionFactory {
 
     private final RedisConnectionFactory masterFactory;
     private final List<RedisConnectionFactory> slaveFactories;
-    private final AtomicInteger counter = new AtomicInteger(0);
+    private final int slaveCount;
 
     public ReadWriteRedisConnectionFactory(RedisConnectionFactory masterFactory, List<RedisConnectionFactory> slaveFactories) {
         this.masterFactory = masterFactory;
         this.slaveFactories = slaveFactories;
+        this.slaveCount = slaveFactories != null ? slaveFactories.size() : 0;
     }
 
     @Override
     public RedisConnection getConnection() {
+        // Return a proxy to handle routing on each connection usage
         return ReadWriteRedisConnectionProxy.create(this);
     }
 
@@ -44,19 +49,31 @@ public class ReadWriteRedisConnectionFactory implements RedisConnectionFactory {
         return masterFactory.translateExceptionIfPossible(ex);
     }
 
+    /**
+     * Determines the actual factory to use based on the current context.
+     * High-performance routing: O(1) complexity.
+     */
     public RedisConnectionFactory getActualFactory() {
         RWType type = RWContextHolder.getRWType();
-        if (type == RWType.READ) {
+        if (type == RWType.READ && slaveCount > 0) {
             return getSlaveFactory();
         }
         return masterFactory;
     }
 
+    /**
+     * Selection logic for slave factories. 
+     * Uses ThreadLocalRandom for zero-contention load balancing in high-concurrency environments.
+     */
     public RedisConnectionFactory getSlaveFactory() {
-        if (slaveFactories.isEmpty()) {
+        if (slaveCount == 0) {
             return masterFactory;
         }
-        int index = Math.abs(counter.getAndIncrement() % slaveFactories.size());
+        if (slaveCount == 1) {
+            return slaveFactories.get(0);
+        }
+        // Use ThreadLocalRandom to avoid AtomicInteger CAS contention in ultra-high concurrency
+        int index = ThreadLocalRandom.current().nextInt(slaveCount);
         return slaveFactories.get(index);
     }
 
