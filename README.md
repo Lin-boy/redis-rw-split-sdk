@@ -1,23 +1,21 @@
-# Redis Read/Write Splitting SDK Starter
+# Redis 读写分离 Spring Boot Starter
 
-A high-performance Spring Boot Starter for automatic Redis Read/Write splitting. It routes write operations to a master Redis instance and read operations to multiple slave instances with lock-free load balancing.
+这是一个专为高性能场景设计的 Redis 读写分离 Spring Boot 组件。它能够自动将写操作路由到主节点（Master），将读操作负载均衡地路由到多个从节点（Slaves），并针对 **JDK 21 虚拟线程** 和 **极高并发场景** 进行了深度优化。
 
-## ✨ Features
-- **Automatic Routing**: Automatically identifies read/write operations based on command names.
-- **Manual Override**: ThreadLocal context (Virtual Thread friendly) to force routing to master or slaves.
-- **High-Concurrency Optimized**: Uses **Lock-Free** load balancing (`ThreadLocalRandom`) to eliminate CAS contention in ultra-high throughput scenarios.
-- **JDK 21+ Ready**: Full support for **Virtual Threads**. Designed to minimize memory footprint and prepared for `ScopedValue`.
-- **Zero Configuration**: Fully integrated with Spring Boot Auto-configuration.
-- **Extensible**: Built using Proxy and Factory patterns for easy integration with Lettuce or Jedis.
+## ✨ 核心特性
+- **自动路由判定**：基于 Redis 命令前缀自动识别读写操作，无需手动干预。
+- **手动路由控制**：通过 `RWContextHolder` 手动强制指定读写链路（虚拟线程友好）。
+- **高并发极致优化**：采用 **无锁（Lock-Free）** 负载均衡算法，消除超高并发下的 CAS 竞争。
+- **JDK 21+ 完美适配**：全面支持 **虚拟线程（Virtual Threads）**，内存占用极低，预留 `ScopedValue` 接口。
+- **零侵入设计**：完全集成 Spring Boot 自动配置，直接注入 `RedisTemplate` 即可使用。
 
-## 🚀 Performance for JDK 21 & High Concurrency
-This SDK is specifically tuned for modern Java environments:
-1. **ThreadLocalRandom**: Replaced `AtomicInteger` with `ThreadLocalRandom` for slave selection, providing near-linear scalability as CPU cores increase.
-2. **Virtual Thread Safety**: `RWContextHolder` is optimized for the lifecycle of Virtual Threads, ensuring no memory leaks and consistent routing.
-3. **Smart Defaults**: Defaults to `WRITE` (Master) routing if the context is lost (e.g., during async handovers), prioritizing data consistency.
+## 🚀 性能亮点 (JDK 21 & 高并发)
+1. **无锁负载均衡**：使用 `ThreadLocalRandom` 代替 `AtomicInteger` 进行从库选择，随着 CPU 核心数增加，吞吐量近乎线性增长。
+2. **虚拟线程安全**：`RWContextHolder` 针对虚拟线程生命周期优化，防止在数百万计的虚拟线程环境下产生内存泄漏。
+3. **安全降级策略**：当上下文丢失（如跨线程切换）时，默认路由至主库（WRITE），确保数据强一致性。
 
-## 📦 Installation
-Add the dependency to your `pom.xml`:
+## 📦 安装说明
+在 `pom.xml` 中引入依赖：
 
 ```xml
 <dependency>
@@ -27,8 +25,8 @@ Add the dependency to your `pom.xml`:
 </dependency>
 ```
 
-## ⚙️ Configuration
-Add the following to your `application.yml`:
+## ⚙️ 配置参考
+在 `application.yml` 中配置主从节点：
 
 ```yaml
 spring:
@@ -45,62 +43,104 @@ spring:
           port: 6379
 ```
 
-## 💡 Usage
+---
 
-### Automatic Routing
-Standard `RedisTemplate` or `StringRedisTemplate` will automatically route commands:
+## 🛠️ 设计原理
 
+### 1. 核心架构
+本 SDK 基于 **工厂模式** 和 **代理模式** 实现：
+
+- **`ReadWriteRedisConnectionFactory`**: 包装类，持有主从多个真实的 `LettuceConnectionFactory`。
+- **`ReadWriteRedisConnectionProxy`**: 核心逻辑，通过 JDK 动态代理拦截 `RedisConnection` 的所有方法调用。
+
+### 2. 路由决策逻辑
+每次 Redis 操作都会经过以下决策树：
+
+1. **显式上下文 (Explicit Context)**：优先检查 `RWContextHolder` 中是否手动设置了 `READ` 或 `WRITE`。
+2. **命令分析 (Command Analysis)**：若无手动设置，分析 Redis 命令名（如 `GET`, `HGET` -> 读；`SET`, `DEL` -> 写）。
+3. **安全兜底 (Safe Fallback)**：若无法判定，默认路由至主库（MASTER），防止数据丢失。
+
+### 3. 无锁负载均衡实现
+传统的轮询算法通常使用 `AtomicInteger.getAndIncrement()`，但在极高并发下，多个线程争抢同一个缓存行（Cache Line）会导致严重的 CAS 失败和总线锁开销。
+本项目采用：
+```java
+// 使用 ThreadLocalRandom 消除线程间竞争
+int index = ThreadLocalRandom.current().nextInt(slaveCount);
+return slaveFactories.get(index);
+```
+
+---
+
+## 📊 交互时序图
+
+以下是应用发起一个 `GET` 请求时的处理流程：
+
+```mermaid
+sequenceDiagram
+    participant App as 应用代码
+    participant Template as RedisTemplate
+    participant Proxy as ReadWriteRedisConnectionProxy
+    participant Context as RWContextHolder
+    participant Factory as ReadWriteRedisConnectionFactory
+
+    App->>Template: opsForValue().get("key")
+    Template->>Factory: getConnection()
+    Factory-->>Template: 返回代理连接 (Proxy)
+    
+    Template->>Proxy: 执行 get("key")
+    Proxy->>Context: getRWType()
+    Context-->>Proxy: 返回 NULL (未手动指定)
+    
+    Proxy->>Proxy: 分析命令: "get" 是读操作
+    
+    Proxy->>Factory: getSlaveFactory() (负载均衡选择)
+    Factory-->>Proxy: 返回 Slave2 Factory
+    
+    Proxy->>Slave2: 执行真实的 Redis 命令
+    Slave2-->>Proxy: 返回结果
+    Proxy-->>Template: 返回结果
+    Template-->>App: 返回数据
+```
+
+---
+
+## 💡 使用示例
+
+### 自动路由
 ```java
 @Autowired
 private StringRedisTemplate redisTemplate;
 
 public void demo() {
-    // Routes to Master (SET is a write operation)
-    redisTemplate.opsForValue().set("key", "value");
+    // 自动路由到主库 (写操作)
+    redisTemplate.opsForValue().set("user:1", "Alice");
     
-    // Routes to Slaves (GET is a read operation, load balanced via ThreadLocalRandom)
-    String val = redisTemplate.opsForValue().get("key");
+    // 自动路由到从库 (读操作，负载均衡)
+    String val = redisTemplate.opsForValue().get("user:1");
 }
 ```
 
-### Manual Routing Override
-Use `RWContextHolder` to manually specify routing. **Always use try-finally** to ensure context is cleared, especially when using Virtual Threads or Thread Pools.
-
+### 手动强制路由
+在需要“写后立即读”的场景，可以通过显式上下文强制读取主库：
 ```java
 try {
-    RWContextHolder.setRWType(RWType.WRITE);
-    // This GET will be forced to Master for read-after-write consistency
-    String val = redisTemplate.opsForValue().get("key");
+    RWContextHolder.setRWType(RWType.WRITE); // 强制路由到主库
+    String val = redisTemplate.opsForValue().get("user:1");
 } finally {
-    RWContextHolder.clear();
+    RWContextHolder.clear(); // 务必清理上下文
 }
 ```
 
-## 🧪 Testing & Validation
-The SDK includes a high-concurrency stress test that automatically detects your JDK version:
+---
+
+## 🧪 压力测试
+SDK 内置了模拟 2000+ 并发任务的压力测试类，支持自动识别 JDK 21 虚拟线程：
 
 ```bash
-# Runs stress tests with 2000+ concurrent tasks
-# Uses Virtual Threads if running on JDK 21+
 mvn test -Dtest=RedisRWHighConcurrencyTest
 ```
 
-## 🛠️ Internal Architecture
-
-### Lock-Free Load Balancing
-In high-concurrency scenarios, traditional `AtomicInteger` based Round-Robin suffers from cache line contention. Our implementation uses:
-```java
-int index = ThreadLocalRandom.current().nextInt(slaveCount);
-return slaveFactories.get(index);
-```
-This ensures zero-contention even with thousands of concurrent virtual threads.
-
-### Routing Logic Priority
-1. **Explicit Context**: Checked first via `RWContextHolder`.
-2. **Command Analysis**: If no context, the SDK analyzes the Redis command name (e.g., `GET`, `HGET` -> READ; `SET`, `DEL` -> WRITE).
-3. **Safe Fallback**: Defaults to `MASTER` to prevent data loss or inconsistency.
-
-## 🛣️ Roadmap
-- [ ] **AOP Support**: `@Read` and `@Write` annotations for easier context management.
-- [ ] **Health Checks**: Automatic removal of failed slave nodes.
-- [ ] **ScopedValue Integration**: Transition from `ThreadLocal` to `ScopedValue` when JDK 21 is detected.
+## 🛣️ 路线图
+- [ ] **AOP 注解支持**：提供 `@Read` 和 `@Write` 注解。
+- [ ] **健康检查**：自动剔除宕机的从节点。
+- [ ] **JDK 21 ScopedValue 深度集成**：在 JDK 21 环境下彻底取代 ThreadLocal。
